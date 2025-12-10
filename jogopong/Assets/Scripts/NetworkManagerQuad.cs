@@ -23,6 +23,7 @@ public class NetworkManagerQuad : MonoBehaviour
     public Transform paddle4;
     public Transform ball;
     public GameManager gameManager;
+    public ChatUI chatUI;
 
     [Header("Configuração da bola")]
     public float velocidadeBola = 6f;
@@ -35,25 +36,40 @@ public class NetworkManagerQuad : MonoBehaviour
     private IPEndPoint remoteEP;
     private ConcurrentQueue<(string, IPEndPoint)> recvQueue = new ConcurrentQueue<(string, IPEndPoint)>();
     private IPEndPoint[] clients = new IPEndPoint[3];
+
     private float lastSend;
     private Vector2 ballPos, ballVel;
+
+    // ---------------------- MENSAGENS ----------------------
 
     [Serializable]
     public struct InputMsg
     {
+        public string type; // "input"
         public int paddleIndex;
         public float paddleY;
     }
 
     [Serializable]
+    public struct ChatMsg
+    {
+        public string type;  // "chat"
+        public string author;
+        public string message;
+    }
+
+    [Serializable]
     public struct StateMsg
     {
+        public string type;  // "state"
         public float[] paddlesY;
         public float ballX;
         public float ballY;
         public int scoreA;
         public int scoreB;
     }
+
+    // ---------------------- INICIALIZAÇÃO ----------------------
 
     void Start()
     {
@@ -64,7 +80,10 @@ public class NetworkManagerQuad : MonoBehaviour
             Task.Run(ReceiveLoop);
 
             ballPos = ball.position;
-            ballVel = new Vector2(velocidadeBola, UnityEngine.Random.Range(-velocidadeBola, velocidadeBola));
+            ballVel = new Vector2(
+                velocidadeBola,
+                UnityEngine.Random.Range(-velocidadeBola, velocidadeBola)
+            );
         }
         else
         {
@@ -89,6 +108,8 @@ public class NetworkManagerQuad : MonoBehaviour
         }
     }
 
+    // ---------------------- UPDATE ----------------------
+
     void Update()
     {
         ProcessReceivedMessages();
@@ -101,6 +122,8 @@ public class NetworkManagerQuad : MonoBehaviour
         }
     }
 
+    // ---------------------- RECEBIMENTO ----------------------
+
     private void ProcessReceivedMessages()
     {
         while (recvQueue.TryDequeue(out var entry))
@@ -108,9 +131,42 @@ public class NetworkManagerQuad : MonoBehaviour
             string msg = entry.Item1;
             IPEndPoint sender = entry.Item2;
 
-            if (mode == Mode.Host)
+            string type = "";
+
+            try
+            {
+                type = JsonUtility.FromJson<ChatMsg>(msg).type;
+            }
+            catch { continue; }
+
+            // ------- CHAT -------
+            if (type == "chat")
+            {
+                var chat = JsonUtility.FromJson<ChatMsg>(msg);
+
+                if (mode == Mode.Host)
+                {
+                    // host repassa para todos
+                    foreach (var c in clients)
+                        if (c != null)
+                            udp.SendAsync(Encoding.UTF8.GetBytes(msg), msg.Length, c);
+
+                    chatUI.AddMessage($"{chat.author}: {chat.message}");
+                }
+                else
+                {
+                    // cliente recebe do host
+                    chatUI.AddMessage($"{chat.author}: {chat.message}");
+                }
+
+                continue;
+            }
+
+            // ------- INPUT -------
+            if (type == "input" && mode == Mode.Host)
             {
                 var input = JsonUtility.FromJson<InputMsg>(msg);
+
                 Transform target = input.paddleIndex switch
                 {
                     2 => paddle2,
@@ -118,6 +174,7 @@ public class NetworkManagerQuad : MonoBehaviour
                     4 => paddle4,
                     _ => null
                 };
+
                 if (target != null)
                 {
                     Vector3 p = target.position;
@@ -125,30 +182,42 @@ public class NetworkManagerQuad : MonoBehaviour
                     target.position = p;
                 }
 
+                // registra client se ainda não existe
                 for (int i = 0; i < clients.Length; i++)
                     if (clients[i] == null)
                     {
                         clients[i] = sender;
                         break;
                     }
+
+                continue;
             }
-            else
+
+            // ------- STATE -------
+            if (type == "state" && mode == Mode.Client)
             {
                 var state = JsonUtility.FromJson<StateMsg>(msg);
+
                 float[] py = state.paddlesY;
                 paddle1.position = new Vector3(paddle1.position.x, py[0], 0);
                 paddle2.position = new Vector3(paddle2.position.x, py[1], 0);
                 paddle3.position = new Vector3(paddle3.position.x, py[2], 0);
                 paddle4.position = new Vector3(paddle4.position.x, py[3], 0);
+
                 ball.position = new Vector3(state.ballX, state.ballY, 0);
                 gameManager.SetPontuacao(state.scoreA, state.scoreB);
+
+                continue;
             }
         }
     }
 
+    // ---------------------- INPUT LOCAL ----------------------
+
     private void ProcessLocalInput()
     {
         float movimento = Input.GetAxis("Vertical") * velocidadeDoJogador * Time.deltaTime;
+
         Transform minhaRaquete = paddleIndex switch
         {
             1 => paddle1,
@@ -157,16 +226,22 @@ public class NetworkManagerQuad : MonoBehaviour
             4 => paddle4,
             _ => null
         };
+
         if (minhaRaquete != null)
         {
             Vector3 pos = minhaRaquete.position;
-            pos.y += movimento;
-            pos.y = Mathf.Clamp(pos.y, -4.5f, 4.5f);
+            pos.y = Mathf.Clamp(pos.y + movimento, -4.5f, 4.5f);
             minhaRaquete.position = pos;
 
             if (mode != Mode.Host)
             {
-                InputMsg input = new InputMsg { paddleIndex = paddleIndex, paddleY = pos.y };
+                InputMsg input = new InputMsg
+                {
+                    type = "input",
+                    paddleIndex = paddleIndex,
+                    paddleY = pos.y
+                };
+
                 string json = JsonUtility.ToJson(input);
                 byte[] data = Encoding.UTF8.GetBytes(json);
                 udp.SendAsync(data, data.Length, remoteEP);
@@ -174,10 +249,15 @@ public class NetworkManagerQuad : MonoBehaviour
         }
     }
 
+    // ---------------------- BOLA (HOST APENAS) ----------------------
+
     private void UpdateBallAndCollisions()
     {
         ballPos += ballVel * Time.deltaTime;
-        if (ballPos.y > 4.5f || ballPos.y < -4.5f) ballVel.y = -ballVel.y;
+
+        if (ballPos.y > 4.5f || ballPos.y < -4.5f)
+            ballVel.y = -ballVel.y;
+
         CheckCollision(paddle1);
         CheckCollision(paddle2);
         CheckCollision(paddle3);
@@ -193,6 +273,7 @@ public class NetworkManagerQuad : MonoBehaviour
             gameManager.AumentarPontuacaoDoJogador1();
             ResetBall(-1);
         }
+
         ball.position = new Vector3(ballPos.x, ballPos.y, 0);
     }
 
@@ -208,8 +289,13 @@ public class NetworkManagerQuad : MonoBehaviour
     private void ResetBall(int dir)
     {
         ballPos = Vector2.zero;
-        ballVel = new Vector2(velocidadeBola * dir, UnityEngine.Random.Range(-velocidadeBola, velocidadeBola));
+        ballVel = new Vector2(
+            velocidadeBola * dir,
+            UnityEngine.Random.Range(-velocidadeBola, velocidadeBola)
+        );
     }
+
+    // ---------------------- ENVIO DE ESTADO (HOST) ----------------------
 
     private void SendStateToClients()
     {
@@ -217,6 +303,7 @@ public class NetworkManagerQuad : MonoBehaviour
         {
             var state = new StateMsg
             {
+                type = "state",
                 paddlesY = new float[]
                 {
                     paddle1.position.y,
@@ -232,16 +319,48 @@ public class NetworkManagerQuad : MonoBehaviour
 
             string json = JsonUtility.ToJson(state);
             byte[] data = Encoding.UTF8.GetBytes(json);
+
             foreach (var c in clients)
-                if (c != null) udp.SendAsync(data, data.Length, c);
+                if (c != null)
+                    udp.SendAsync(data, data.Length, c);
+
             lastSend = Time.time;
         }
     }
+
+    // ---------------------- ENVIO DE CHAT (chamado pelo ChatUI) ----------------------
+
+    public void EnviarChat(string author, string message)
+    {
+        ChatMsg chat = new ChatMsg
+        {
+            type = "chat",
+            author = author,
+            message = message
+        };
+
+        string json = JsonUtility.ToJson(chat);
+        byte[] data = Encoding.UTF8.GetBytes(json);
+
+        if (mode == Mode.Client)
+        {
+            udp.SendAsync(data, data.Length, remoteEP);
+        }
+        else
+        {
+            chatUI.AddMessage($"{author}: {message}");
+
+            foreach (var c in clients)
+                if (c != null)
+                    udp.SendAsync(data, data.Length, c);
+        }
+    }
+
+    // ----------------------
 
     void OnApplicationQuit()
     {
         udp?.Close();
         udp = null;
     }
-
 }
